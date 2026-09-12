@@ -1,0 +1,650 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+import "@openzeppelin/contracts@5.7.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.7.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.7.0/utils/ReentrancyGuard.sol";
+
+/// @title 1M BLOCKS MINE Vesting
+/// @author 1M BLOCKS
+/// @notice Fixed vesting contract for the MINE project/team allocation on BNB Chain.
+/// @dev
+/// Security and design properties:
+/// - The fixed vesting allocation is exactly 20,000,000 MINE.
+/// - The vesting schedule is permanently fixed and cannot be modified after deployment.
+/// - The schedule consists of exactly 40 quarterly tranches of 500,000 MINE each.
+/// - The first tranche unlocks on 2028-07-25 08:00:00 UTC.
+/// - The final tranche unlocks on 2038-04-25 08:00:00 UTC.
+/// - Unclaimed vested amounts remain claimable and accumulate over time.
+/// - Only the designated beneficiary may claim vested MINE.
+/// - No owner or administrative role exists.
+/// - No pause mechanism exists.
+/// - No beneficiary-change mechanism exists.
+/// - No token recovery mechanism exists.
+/// - No proxy or upgrade mechanism is implemented.
+/// - Direct native BNB transfers and unknown calls are rejected.
+contract Vesting is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /// @dev
+    /// Complete project/team allocation using the standard ERC20
+    /// 18-decimal representation.
+    uint256 private constant _TOTAL_ALLOCATION =
+        20_000_000 * 1e18;
+
+    /// @dev
+    /// Fixed amount of MINE released by each vesting tranche.
+    uint256 private constant _TRANCHE_AMOUNT =
+        500_000 * 1e18;
+
+    /// @dev
+    /// Complete number of fixed vesting tranches.
+    uint256 private constant _TOTAL_TRANCHES =
+        40;
+
+    /// @dev
+    /// Timestamp of the first vesting release:
+    /// 2028-07-25 08:00:00 UTC.
+    uint256 private constant _FIRST_VESTING_TIME =
+        1848124800;
+
+    /// @dev
+    /// Timestamp of the final vesting release:
+    /// 2038-04-25 08:00:00 UTC.
+    uint256 private constant _FINAL_VESTING_TIME =
+        2155795200;
+
+    // =============================================================
+    //                             ERRORS
+    // =============================================================
+
+    /// @dev The supplied vesting token address is the zero address.
+    error InvalidTokenAddress();
+
+    /// @dev The supplied beneficiary address is the zero address.
+    error InvalidBeneficiary();
+
+    /// @dev The caller is not the designated beneficiary.
+    error UnauthorizedCaller();
+
+    /// @dev No vested and unclaimed MINE is currently available.
+    error NothingToClaim();
+
+    /// @dev
+    /// The contract does not hold enough MINE to satisfy the
+    /// currently claimable amount.
+    error InsufficientVestedTokenBalance(
+        uint256 requiredAmount,
+        uint256 availableAmount
+    );
+
+    /// @dev The supplied tranche index is outside the valid range.
+    error InvalidTrancheIndex();
+
+    /// @dev Direct native BNB transfers are intentionally unavailable.
+    error DirectBNBTransferNotAllowed();
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /// @dev
+    /// ERC20 token designated for this MINE vesting contract.
+    IERC20 public immutable vestedToken;
+
+    /// @dev
+    /// Immutable address exclusively authorized to claim vested MINE.
+    address public immutable beneficiary;
+
+    /// @dev
+    /// Complete amount of vested MINE already claimed by the beneficiary.
+    uint256 public totalClaimed;
+
+    // =============================================================
+    //                             EVENTS
+    // =============================================================
+
+    /// @notice Emitted whenever vested MINE is successfully claimed.
+    /// @param beneficiary_ Address receiving the vested MINE.
+    /// @param amount Amount of MINE claimed in the transaction.
+    /// @param totalClaimedAmount Complete amount claimed after the transaction.
+    event TokensClaimed(
+        address indexed beneficiary_,
+        uint256 amount,
+        uint256 totalClaimedAmount
+    );
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /// @notice Deploys the fixed MINE vesting contract on BNB Chain.
+    /// @dev
+    /// The configured token and beneficiary addresses become immutable
+    /// after deployment.
+    ///
+    /// Deployment does not fund the vesting allocation automatically.
+    /// The required MINE must be transferred to this contract separately.
+    ///
+    /// No owner, administrator, upgrade, pause, beneficiary-change,
+    /// or token-recovery mechanism is created.
+    ///
+    /// @param vestedToken_ ERC20 token address designated for the vesting schedule.
+    /// @param beneficiary_ Address exclusively authorized to claim vested MINE.
+    constructor(
+        address vestedToken_,
+        address beneficiary_
+    ) {
+        if (vestedToken_ == address(0)) {
+            revert InvalidTokenAddress();
+        }
+
+        if (beneficiary_ == address(0)) {
+            revert InvalidBeneficiary();
+        }
+
+        vestedToken =
+            IERC20(vestedToken_);
+
+        beneficiary =
+            beneficiary_;
+    }
+
+    // =============================================================
+    //                       CORE FUNCTIONS
+    // =============================================================
+
+    /// @notice Claims all currently vested and unclaimed MINE.
+    /// @dev
+    /// Only the immutable beneficiary may execute this function.
+    ///
+    /// The claimable amount is calculated from the complete vested
+    /// allocation minus the complete amount already claimed.
+    ///
+    /// If multiple tranches unlock without being claimed, their amounts
+    /// accumulate and are transferred together in a later claim.
+    ///
+    /// The complete call reverts if the contract does not hold enough
+    /// MINE to satisfy the currently claimable amount.
+    ///
+    /// Claim accounting is updated before the external token transfer.
+    /// ReentrancyGuard additionally protects the external claim path.
+    ///
+    /// Requirements:
+    /// - caller must be the designated beneficiary;
+    /// - at least one vested and unclaimed amount must exist;
+    /// - the contract must hold sufficient MINE.
+    function claim()
+        external
+        nonReentrant
+    {
+        if (msg.sender != beneficiary) {
+            revert UnauthorizedCaller();
+        }
+
+        uint256 amount =
+            getClaimableAmount();
+
+        if (amount == 0) {
+            revert NothingToClaim();
+        }
+
+        uint256 availableAmount =
+            vestedToken.balanceOf(
+                address(this)
+            );
+
+        if (availableAmount < amount) {
+            revert InsufficientVestedTokenBalance(
+                amount,
+                availableAmount
+            );
+        }
+
+        totalClaimed +=
+            amount;
+
+        vestedToken.safeTransfer(
+            beneficiary,
+            amount
+        );
+
+        emit TokensClaimed(
+            beneficiary,
+            amount,
+            totalClaimed
+        );
+    }
+
+    // =============================================================
+    //                      VIEW FUNCTIONS
+    // =============================================================
+
+    /// @notice
+    /// Returns the complete amount of MINE vested at the current
+    /// block timestamp.
+    ///
+    /// @dev
+    /// Vesting occurs only at the predefined tranche timestamps.
+    ///
+    /// This value represents the complete vested allocation and does
+    /// not subtract MINE already claimed by the beneficiary.
+    ///
+    /// @return vestedAmount Complete amount of MINE vested so far.
+    function getVestedAmount()
+        public
+        view
+        returns (
+            uint256 vestedAmount
+        )
+    {
+        uint256 unlockedTrancheCount =
+            getUnlockedTrancheCount();
+
+        if (unlockedTrancheCount == 0) {
+            return 0;
+        }
+
+        return
+            unlockedTrancheCount *
+            _TRANCHE_AMOUNT;
+    }
+
+    /// @notice Returns the amount of MINE currently available to claim.
+    /// @dev
+    /// The claimable amount equals the complete vested amount minus
+    /// the complete amount already claimed.
+    ///
+    /// @return claimableAmount MINE currently available to the beneficiary.
+    function getClaimableAmount()
+        public
+        view
+        returns (
+            uint256 claimableAmount
+        )
+    {
+        uint256 vestedAmount =
+            getVestedAmount();
+
+        uint256 claimedAmount =
+            totalClaimed;
+
+        if (vestedAmount <= claimedAmount) {
+            return 0;
+        }
+
+        return
+            vestedAmount -
+            claimedAmount;
+    }
+
+    /// @notice Returns the remaining unclaimed MINE allocation.
+    /// @dev
+    /// This value represents vesting accounting only.
+    ///
+    /// It is calculated from the fixed total allocation and the amount
+    /// already claimed and is not the live MINE balance of this contract.
+    ///
+    /// @return remainingAllocation Complete unclaimed allocation.
+    function getRemainingAllocation()
+        external
+        view
+        returns (
+            uint256 remainingAllocation
+        )
+    {
+        return
+            _TOTAL_ALLOCATION -
+            totalClaimed;
+    }
+
+    /// @notice Returns the number of currently unlocked vesting tranches.
+    /// @dev
+    /// Returns zero before the first fixed release timestamp.
+    ///
+    /// Returns the complete tranche count at or after the final fixed
+    /// release timestamp.
+    ///
+    /// Between those timestamps, the fixed schedule is searched from
+    /// the latest tranche backward.
+    ///
+    /// @return unlockedTrancheCount Number of currently unlocked tranches.
+    function getUnlockedTrancheCount()
+        public
+        view
+        returns (
+            uint256 unlockedTrancheCount
+        )
+    {
+        uint256 currentTimestamp =
+            block.timestamp;
+
+        if (
+            currentTimestamp <
+            _FIRST_VESTING_TIME
+        ) {
+            return 0;
+        }
+
+        if (
+            currentTimestamp >=
+            _FINAL_VESTING_TIME
+        ) {
+            return
+                _TOTAL_TRANCHES;
+        }
+
+        for (
+            uint256 i = _TOTAL_TRANCHES;
+            i > 0;
+        ) {
+            unchecked {
+                --i;
+            }
+
+            if (
+                currentTimestamp >=
+                _getReleaseTimeByIndex(i)
+            ) {
+                return
+                    i + 1;
+            }
+        }
+
+        return 0;
+    }
+
+    /// @notice Returns the complete fixed MINE allocation.
+    /// @return totalAllocation Complete allocation governed by this contract.
+    function getTotalAllocation()
+        external
+        pure
+        returns (
+            uint256 totalAllocation
+        )
+    {
+        return
+            _TOTAL_ALLOCATION;
+    }
+
+    /// @notice Returns the fixed amount of MINE released by each tranche.
+    /// @return trancheAmount Amount of MINE released by one tranche.
+    function getTrancheAmount()
+        external
+        pure
+        returns (
+            uint256 trancheAmount
+        )
+    {
+        return
+            _TRANCHE_AMOUNT;
+    }
+
+    /// @notice Returns the complete number of vesting tranches.
+    /// @return totalTranches Complete tranche count.
+    function getTotalTranches()
+        external
+        pure
+        returns (
+            uint256 totalTranches
+        )
+    {
+        return
+            _TOTAL_TRANCHES;
+    }
+
+    /// @notice Returns the first fixed vesting timestamp.
+    /// @return firstVestingTime First tranche release timestamp.
+    function getFirstVestingTime()
+        external
+        pure
+        returns (
+            uint256 firstVestingTime
+        )
+    {
+        return
+            _FIRST_VESTING_TIME;
+    }
+
+    /// @notice Returns the final fixed vesting timestamp.
+    /// @return finalVestingTime Final tranche release timestamp.
+    function getFinalVestingTime()
+        external
+        pure
+        returns (
+            uint256 finalVestingTime
+        )
+    {
+        return
+            _FINAL_VESTING_TIME;
+    }
+
+    /// @notice Returns the live MINE balance currently held by this contract.
+    /// @dev
+    /// The live balance may differ from the remaining vesting allocation
+    /// if this contract is underfunded or overfunded.
+    ///
+    /// @return vaultTokenBalance Current MINE balance of this contract.
+    function getVaultTokenBalance()
+        external
+        view
+        returns (
+            uint256 vaultTokenBalance
+        )
+    {
+        return
+            vestedToken.balanceOf(
+                address(this)
+            );
+    }
+
+    /// @notice
+    /// Returns the MINE funding deficit for the remaining
+    /// vesting obligation.
+    ///
+    /// @dev
+    /// Returns zero when the live contract balance is equal to or greater
+    /// than the complete remaining unclaimed allocation.
+    ///
+    /// Otherwise, the difference between the remaining allocation and
+    /// the live contract balance is returned.
+    ///
+    /// @return fundingDeficit Additional MINE required for complete funding.
+    function getFundingDeficit()
+        external
+        view
+        returns (
+            uint256 fundingDeficit
+        )
+    {
+        uint256 remainingRequired =
+            _TOTAL_ALLOCATION -
+            totalClaimed;
+
+        uint256 currentBalance =
+            vestedToken.balanceOf(
+                address(this)
+            );
+
+        if (
+            currentBalance >=
+            remainingRequired
+        ) {
+            return 0;
+        }
+
+        return
+            remainingRequired -
+            currentBalance;
+    }
+
+    /// @notice Returns the fixed release timestamp for a tranche.
+    /// @dev Valid tranche indexes range from 0 through 39.
+    /// @param trancheIndex Tranche index to inspect.
+    /// @return releaseTime Fixed release timestamp of the tranche.
+    function getReleaseTime(
+        uint256 trancheIndex
+    )
+        external
+        pure
+        returns (
+            uint256 releaseTime
+        )
+    {
+        if (
+            trancheIndex >=
+            _TOTAL_TRANCHES
+        ) {
+            revert InvalidTrancheIndex();
+        }
+
+        return
+            _getReleaseTimeByIndex(
+                trancheIndex
+            );
+    }
+
+    /// @notice Returns the fixed MINE amount released by a tranche.
+    /// @dev Valid tranche indexes range from 0 through 39.
+    /// @param trancheIndex Tranche index to inspect.
+    /// @return releaseAmount Fixed MINE amount released by the tranche.
+    function getReleaseAmount(
+        uint256 trancheIndex
+    )
+        external
+        pure
+        returns (
+            uint256 releaseAmount
+        )
+    {
+        if (
+            trancheIndex >=
+            _TOTAL_TRANCHES
+        ) {
+            revert InvalidTrancheIndex();
+        }
+
+        return
+            _TRANCHE_AMOUNT;
+    }
+
+    /// @notice Returns whether a specific tranche is currently unlocked.
+    /// @dev Valid tranche indexes range from 0 through 39.
+    /// @param trancheIndex Tranche index to inspect.
+    /// @return unlocked True when the tranche release timestamp has been reached.
+    function isTrancheUnlocked(
+        uint256 trancheIndex
+    )
+        external
+        view
+        returns (
+            bool unlocked
+        )
+    {
+        if (
+            trancheIndex >=
+            _TOTAL_TRANCHES
+        ) {
+            revert InvalidTrancheIndex();
+        }
+
+        return
+            block.timestamp >=
+            _getReleaseTimeByIndex(
+                trancheIndex
+            );
+    }
+
+    // =============================================================
+    //                      INTERNAL HELPERS
+    // =============================================================
+
+    /// @dev
+    /// Returns the permanently fixed release timestamp associated with
+    /// a tranche index.
+    ///
+    /// All current callers restrict the tranche index to the valid
+    /// range from 0 through 39.
+    ///
+    /// @param trancheIndex Tranche index whose timestamp will be returned.
+    /// @return releaseTime Fixed UTC release timestamp.
+    function _getReleaseTimeByIndex(
+        uint256 trancheIndex
+    )
+        internal
+        pure
+        returns (
+            uint256 releaseTime
+        )
+    {
+        if (trancheIndex == 0) return 1848124800;  // 2028-07-25 08:00:00 UTC
+        if (trancheIndex == 1) return 1856073600;  // 2028-10-25 08:00:00 UTC
+        if (trancheIndex == 2) return 1864022400;  // 2029-01-25 08:00:00 UTC
+        if (trancheIndex == 3) return 1871798400;  // 2029-04-25 08:00:00 UTC
+        if (trancheIndex == 4) return 1879660800;  // 2029-07-25 08:00:00 UTC
+        if (trancheIndex == 5) return 1887609600;  // 2029-10-25 08:00:00 UTC
+        if (trancheIndex == 6) return 1895558400;  // 2030-01-25 08:00:00 UTC
+        if (trancheIndex == 7) return 1903334400;  // 2030-04-25 08:00:00 UTC
+        if (trancheIndex == 8) return 1911196800;  // 2030-07-25 08:00:00 UTC
+        if (trancheIndex == 9) return 1919145600;  // 2030-10-25 08:00:00 UTC
+        if (trancheIndex == 10) return 1927094400; // 2031-01-25 08:00:00 UTC
+        if (trancheIndex == 11) return 1934870400; // 2031-04-25 08:00:00 UTC
+        if (trancheIndex == 12) return 1942732800; // 2031-07-25 08:00:00 UTC
+        if (trancheIndex == 13) return 1950681600; // 2031-10-25 08:00:00 UTC
+        if (trancheIndex == 14) return 1958630400; // 2032-01-25 08:00:00 UTC
+        if (trancheIndex == 15) return 1966492800; // 2032-04-25 08:00:00 UTC
+        if (trancheIndex == 16) return 1974355200; // 2032-07-25 08:00:00 UTC
+        if (trancheIndex == 17) return 1982304000; // 2032-10-25 08:00:00 UTC
+        if (trancheIndex == 18) return 1990252800; // 2033-01-25 08:00:00 UTC
+        if (trancheIndex == 19) return 1998028800; // 2033-04-25 08:00:00 UTC
+        if (trancheIndex == 20) return 2005891200; // 2033-07-25 08:00:00 UTC
+        if (trancheIndex == 21) return 2013840000; // 2033-10-25 08:00:00 UTC
+        if (trancheIndex == 22) return 2021788800; // 2034-01-25 08:00:00 UTC
+        if (trancheIndex == 23) return 2029564800; // 2034-04-25 08:00:00 UTC
+        if (trancheIndex == 24) return 2037427200; // 2034-07-25 08:00:00 UTC
+        if (trancheIndex == 25) return 2045376000; // 2034-10-25 08:00:00 UTC
+        if (trancheIndex == 26) return 2053324800; // 2035-01-25 08:00:00 UTC
+        if (trancheIndex == 27) return 2061100800; // 2035-04-25 08:00:00 UTC
+        if (trancheIndex == 28) return 2068963200; // 2035-07-25 08:00:00 UTC
+        if (trancheIndex == 29) return 2076912000; // 2035-10-25 08:00:00 UTC
+        if (trancheIndex == 30) return 2084860800; // 2036-01-25 08:00:00 UTC
+        if (trancheIndex == 31) return 2092723200; // 2036-04-25 08:00:00 UTC
+        if (trancheIndex == 32) return 2100585600; // 2036-07-25 08:00:00 UTC
+        if (trancheIndex == 33) return 2108534400; // 2036-10-25 08:00:00 UTC
+        if (trancheIndex == 34) return 2116483200; // 2037-01-25 08:00:00 UTC
+        if (trancheIndex == 35) return 2124259200; // 2037-04-25 08:00:00 UTC
+        if (trancheIndex == 36) return 2132121600; // 2037-07-25 08:00:00 UTC
+        if (trancheIndex == 37) return 2140070400; // 2037-10-25 08:00:00 UTC
+        if (trancheIndex == 38) return 2148019200; // 2038-01-25 08:00:00 UTC
+
+        return 2155795200;                         // 2038-04-25 08:00:00 UTC
+    }
+
+    // =============================================================
+    //                    FALLBACK FUNCTIONS
+    // =============================================================
+
+    /// @notice Rejects direct native BNB transfers.
+    /// @dev
+    /// Native BNB is neither required nor accepted by this vesting contract.
+    receive()
+        external
+        payable
+    {
+        revert DirectBNBTransferNotAllowed();
+    }
+
+    /// @notice Rejects unknown calls and direct native BNB transfers.
+    /// @dev
+    /// No generic fallback execution path is intentionally provided.
+    fallback()
+        external
+        payable
+    {
+        revert DirectBNBTransferNotAllowed();
+    }
+}
