@@ -1,0 +1,707 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+import "@openzeppelin/contracts@5.7.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.7.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.7.0/access/Ownable2Step.sol";
+import "@openzeppelin/contracts@5.7.0/utils/Pausable.sol";
+import "@openzeppelin/contracts@5.7.0/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts@5.7.0/utils/cryptography/EIP712.sol";
+import "@openzeppelin/contracts@5.7.0/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts@5.7.0/utils/types/Time.sol";
+
+/// @title 1M BLOCKS Halloween Faucet
+/// @author 1M BLOCKS
+/// @notice Fixed-duration MINE faucet for the 2026 1M BLOCKS Halloween event on BNB Chain.
+/// @dev
+/// Security and design properties:
+/// - The designated faucet token address is immutable after deployment.
+/// - The complete faucet distribution allocation is fixed at exactly 1,000,000 M.
+/// - Every successful claim transfers exactly 20 M.
+/// - Each recipient has a 24-hour cooldown between successful claims.
+/// - Repeated claims are permitted after the complete cooldown has elapsed.
+/// - The faucet becomes usable immediately after successful deployment.
+/// - The faucet permanently expires at 2026-11-01 00:00:00 UTC.
+/// - Claims at or after the fixed expiration timestamp are rejected.
+/// - Lifetime faucet distributions can never exceed 1,000,000 M.
+/// - Overfunding the contract does not increase the fixed distribution allocation.
+/// - Every claim requires a valid EIP-712 authorization from the immutable project signer.
+/// - Claim authorizations are bound to the recipient, recipient nonce, chain and contract.
+/// - Every successful claim consumes exactly one recipient nonce, preventing replay.
+/// - Authorization signatures include a deadline and cannot be used after expiration.
+/// - Transaction submission is permissionless; possession of a valid authorization is required.
+/// - A project relayer may submit authorized claims and pay BNB gas on behalf of users.
+/// - The owner cannot modify the signer, claim amount, cooldown, allocation or expiration.
+/// - The owner may pause and unpause faucet claims for emergency response.
+/// - Remaining MINE held by this contract can only be recovered after expiration.
+/// - Ownership transfer uses the two-step Ownable2Step mechanism.
+/// - Ownership renouncement is permanently disabled.
+/// - SafeERC20 is used for every MINE transfer performed by this contract.
+/// - ReentrancyGuard protects external token-transfer paths.
+/// - Direct native BNB transfers and unknown calls are rejected.
+/// - Native BNB is not held by this contract for gas sponsorship.
+/// - Wallet-signature, Turnstile, rate-limit, IP/device and Sybil checks remain off-chain.
+/// - Off-chain approval becomes enforceable on-chain only through the EIP-712 authorization.
+/// - Faucet accounting is independent from the live token balance held by this contract.
+/// - Successful claims are permanently recorded through cooldown, nonce and distribution state.
+/// - No proxy or upgrade mechanism is implemented.
+contract Faucet is
+    EIP712,
+    Ownable2Step,
+    Pausable,
+    ReentrancyGuard
+{
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /// @dev
+    /// Complete fixed MINE distribution allocation for the Halloween
+    /// faucet using the standard ERC20 18-decimal representation.
+    uint256 private constant _FAUCET_ALLOCATION =
+        1_000_000 * 1e18;
+
+    /// @dev
+    /// Fixed MINE amount transferred by every successful faucet claim.
+    uint256 private constant _CLAIM_AMOUNT =
+        20 * 1e18;
+
+    /// @dev
+    /// Required interval between successful faucet claims by the same
+    /// recipient address.
+    uint256 private constant _CLAIM_COOLDOWN =
+        24 hours;
+
+    /// @dev
+    /// Permanent faucet expiration timestamp:
+    /// 2026-11-01 00:00:00 UTC.
+    uint256 private constant _FAUCET_EXPIRATION =
+        1793491200;
+
+    /// @dev
+    /// EIP-712 type hash used for project-authorized faucet claims.
+    ///
+    /// The EIP-712 domain additionally binds every authorization to the
+    /// current chain and this specific deployed faucet contract.
+    bytes32 private constant _CLAIM_TYPEHASH =
+        keccak256(
+            "Claim(address recipient,uint256 nonce,uint256 deadline)"
+        );
+
+    // =============================================================
+    //                             ERRORS
+    // =============================================================
+
+    /// @dev The supplied faucet token address is invalid.
+    error InvalidTokenAddress();
+
+    /// @dev The supplied authorization signer address is the zero address.
+    error InvalidAuthorizationSigner();
+
+    /// @dev The supplied recipient address is the zero address.
+    error InvalidRecipient();
+
+    /// @dev
+    /// Deployment was attempted at or after the permanently fixed
+    /// faucet expiration timestamp.
+    error DeploymentAfterExpiration(
+        uint256 expirationTime
+    );
+
+    /// @dev The permanently fixed faucet expiration timestamp has been reached.
+    error FaucetExpired(
+        uint256 expirationTime
+    );
+
+    /// @dev The supplied claim authorization deadline has already passed.
+    error AuthorizationExpired(
+        uint256 deadline
+    );
+
+    /// @dev The supplied EIP-712 authorization was not signed by the project signer.
+    error InvalidAuthorization();
+
+    /// @dev
+    /// The recipient has already completed a successful faucet claim
+    /// and its 24-hour cooldown has not yet expired.
+    error RecipientInCooldown(
+        address recipient,
+        uint256 nextAvailableAt
+    );
+
+    /// @dev The fixed 1,000,000 M faucet distribution allocation is exhausted.
+    error FaucetAllocationExhausted();
+
+    /// @dev
+    /// The contract does not hold enough MINE to satisfy one fixed
+    /// faucet claim.
+    error InsufficientFaucetTokenBalance(
+        uint256 requiredAmount,
+        uint256 availableAmount
+    );
+
+    /// @dev Remaining faucet tokens cannot be withdrawn before expiration.
+    error FaucetStillActive(
+        uint256 expirationTime
+    );
+
+    /// @dev No MINE balance remains available for post-expiration recovery.
+    error NoTokensToWithdraw();
+
+    /// @dev Ownership renouncement is intentionally unavailable.
+    error OwnershipRenounceDisabled();
+
+    /// @dev Direct native BNB transfers are intentionally unavailable.
+    error DirectBNBTransferNotAllowed();
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /// @dev
+    /// Immutable ERC20 token designated for this Halloween faucet.
+    IERC20 public immutable faucetToken;
+
+    /// @dev
+    /// Immutable project-controlled address authorized to approve faucet
+    /// claims using EIP-712 signatures.
+    address public immutable authorizationSigner;
+
+    /// @dev
+    /// Complete amount of MINE successfully distributed by this faucet.
+    uint256 public totalDistributed;
+
+    /// @dev
+    /// For each recipient, stores the earliest timestamp at which another
+    /// successful faucet claim may be completed.
+    ///
+    /// A zero value means that the address has never completed a claim
+    /// or is otherwise immediately eligible from the cooldown perspective.
+    mapping(address => uint256)
+        private _nextClaimAvailable;
+
+    /// @dev
+    /// For each recipient, stores the nonce required by the next valid
+    /// EIP-712 claim authorization.
+    ///
+    /// The nonce is increased only after a successful claim. Any previously
+    /// used authorization therefore becomes permanently invalid.
+    mapping(address => uint256)
+        private _claimNonces;
+
+    // =============================================================
+    //                             EVENTS
+    // =============================================================
+
+    /// @notice Emitted whenever an authorized faucet claim transfers MINE.
+    /// @param recipient Address receiving the fixed faucet claim amount.
+    /// @param amount Fixed MINE amount transferred by the claim.
+    /// @param nextUnlockTime Earliest timestamp another claim is permitted.
+    /// @param nonce Nonce consumed by the successful claim.
+    event TokensClaimed(
+        address indexed recipient,
+        uint256 amount,
+        uint256 nextUnlockTime,
+        uint256 nonce
+    );
+
+    /// @notice Emitted when remaining MINE is recovered after faucet expiration.
+    /// @param recipient Current owner receiving the remaining MINE.
+    /// @param amount Complete MINE balance recovered from this contract.
+    event RemainingTokensWithdrawn(
+        address indexed recipient,
+        uint256 amount
+    );
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /// @notice Deploys the fixed-duration 2026 Halloween faucet.
+    /// @dev
+    /// The designated MINE token and authorization signer become immutable
+    /// after deployment.
+    ///
+    /// Deployment itself does not fund the faucet allocation automatically.
+    /// MINE must be transferred to this contract separately after deployment.
+    ///
+    /// The authorization signer is intentionally separate from transaction
+    /// submission. A project relayer may pay gas without receiving any direct
+    /// authority to choose recipients or alter faucet terms.
+    ///
+    /// Deployments attempted at or after the fixed expiration timestamp are
+    /// rejected because no valid faucet operating window would remain.
+    ///
+    /// @param faucetToken_ ERC20 token address designated for faucet payouts.
+    /// @param authorizationSigner_ Address designated to sign approved claims.
+    constructor(
+        address faucetToken_,
+        address authorizationSigner_
+    )
+        EIP712(
+            "1M BLOCKS Faucet",
+            "1"
+        )
+        Ownable(msg.sender)
+    {
+        if (
+            faucetToken_ == address(0) ||
+            faucetToken_.code.length == 0
+        ) {
+            revert InvalidTokenAddress();
+        }
+
+        if (authorizationSigner_ == address(0)) {
+            revert InvalidAuthorizationSigner();
+        }
+
+        uint256 currentTimestamp =
+            uint256(Time.timestamp());
+
+        if (
+            currentTimestamp >=
+            _FAUCET_EXPIRATION
+        ) {
+            revert DeploymentAfterExpiration(
+                _FAUCET_EXPIRATION
+            );
+        }
+
+        faucetToken =
+            IERC20(faucetToken_);
+
+        authorizationSigner =
+            authorizationSigner_;
+    }
+
+    // =============================================================
+    //                         FAUCET CLAIMS
+    // =============================================================
+
+    /// @notice
+    /// Transfers the fixed 20 M faucet reward using a project authorization.
+    ///
+    /// @dev
+    /// The caller is intentionally unrestricted. Authorization is established
+    /// exclusively by the EIP-712 signature supplied with the claim.
+    ///
+    /// A project-operated relayer may therefore submit the transaction and pay
+    /// BNB gas without becoming a privileged on-chain role.
+    ///
+    /// Each authorization is bound to the recipient, the recipient's current
+    /// nonce, the authorization deadline, this contract and the current chain.
+    ///
+    /// The recipient nonce prevents successful authorizations from being
+    /// replayed. The nonce is included in the signed payload and increased
+    /// before the external token transfer.
+    ///
+    /// Cooldown state, nonce state and distribution accounting are all updated
+    /// before the external token transfer. A later revert rolls these state
+    /// changes back automatically because the complete transaction is atomic.
+    ///
+    /// Requirements:
+    /// - faucet must not be paused;
+    /// - recipient cannot be the zero address;
+    /// - fixed expiration timestamp must not have been reached;
+    /// - authorization deadline must not have passed;
+    /// - authorization must recover to the immutable project signer;
+    /// - recipient cannot be inside its 24-hour cooldown;
+    /// - fixed lifetime distribution allocation must have at least 20 M remaining;
+    /// - contract must hold at least 20 M.
+    ///
+    /// @param recipient Approved address receiving the fixed 20 M reward.
+    /// @param deadline Last timestamp at which this authorization remains valid.
+    /// @param authorization EIP-712 signature produced by the project signer.
+    function claim(
+        address recipient,
+        uint256 deadline,
+        bytes calldata authorization
+    )
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        if (recipient == address(0)) {
+            revert InvalidRecipient();
+        }
+
+        uint256 currentTimestamp =
+            uint256(Time.timestamp());
+
+        if (
+            currentTimestamp >=
+            _FAUCET_EXPIRATION
+        ) {
+            revert FaucetExpired(
+                _FAUCET_EXPIRATION
+            );
+        }
+
+        if (
+            currentTimestamp >
+            deadline
+        ) {
+            revert AuthorizationExpired(
+                deadline
+            );
+        }
+
+        uint256 nextAvailableAt =
+            _nextClaimAvailable[recipient];
+
+        if (
+            currentTimestamp <
+            nextAvailableAt
+        ) {
+            revert RecipientInCooldown(
+                recipient,
+                nextAvailableAt
+            );
+        }
+
+        if (
+            totalDistributed >
+            _FAUCET_ALLOCATION -
+            _CLAIM_AMOUNT
+        ) {
+            revert FaucetAllocationExhausted();
+        }
+
+        uint256 nonce =
+            _claimNonces[recipient];
+
+        _validateAuthorization(
+            recipient,
+            nonce,
+            deadline,
+            authorization
+        );
+
+        uint256 availableAmount =
+            faucetToken.balanceOf(
+                address(this)
+            );
+
+        if (
+            availableAmount <
+            _CLAIM_AMOUNT
+        ) {
+            revert InsufficientFaucetTokenBalance(
+                _CLAIM_AMOUNT,
+                availableAmount
+            );
+        }
+
+        uint256 nextUnlockTime =
+            currentTimestamp +
+            _CLAIM_COOLDOWN;
+
+        // Effects are committed before the external token movement.
+        // A revert later in this transaction also rolls these storage
+        // changes back automatically.
+        _nextClaimAvailable[recipient] =
+            nextUnlockTime;
+
+        _claimNonces[recipient] =
+            nonce + 1;
+
+        totalDistributed +=
+            _CLAIM_AMOUNT;
+
+        faucetToken.safeTransfer(
+            recipient,
+            _CLAIM_AMOUNT
+        );
+
+        emit TokensClaimed(
+            recipient,
+            _CLAIM_AMOUNT,
+            nextUnlockTime,
+            nonce
+        );
+    }
+
+    // =============================================================
+    //                      INTERNAL HELPERS
+    // =============================================================
+
+    /// @dev
+    /// Validates an EIP-712 faucet authorization against the immutable
+    /// project signer.
+    ///
+    /// The signed payload includes the recipient, current recipient nonce,
+    /// and authorization deadline.
+    ///
+    /// EIP-712 domain separation additionally binds the authorization to
+    /// this deployed faucet contract and the current chain.
+    ///
+    /// @param recipient Address authorized to receive the faucet reward.
+    /// @param nonce Current recipient claim nonce.
+    /// @param deadline Last timestamp at which the authorization remains valid.
+    /// @param authorization EIP-712 signature supplied for the claim.
+    function _validateAuthorization(
+        address recipient,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata authorization
+    )
+        internal
+        view
+    {
+        bytes32 structHash =
+            keccak256(
+                abi.encode(
+                    _CLAIM_TYPEHASH,
+                    recipient,
+                    nonce,
+                    deadline
+                )
+            );
+
+        bytes32 digest =
+            _hashTypedDataV4(
+                structHash
+            );
+
+        if (
+            ECDSA.recoverCalldata(
+                digest,
+                authorization
+            ) != authorizationSigner
+        ) {
+            revert InvalidAuthorization();
+        }
+    }
+
+    // =============================================================
+    //                         VIEW FUNCTIONS
+    // =============================================================
+
+    /// @notice Returns the remaining recipient cooldown in seconds.
+    /// @dev
+    /// Returns zero when the address is immediately eligible from the
+    /// cooldown perspective.
+    ///
+    /// This function does not evaluate pause state, expiration, remaining
+    /// allocation, token funding or off-chain anti-abuse requirements.
+    ///
+    /// @param account Address whose cooldown will be inspected.
+    /// @return remainingTime Remaining cooldown duration in seconds.
+    function getRemainingCooldown(
+        address account
+    )
+        external
+        view
+        returns (
+            uint256 remainingTime
+        )
+    {
+        uint256 unlockTime =
+            _nextClaimAvailable[account];
+
+        uint256 currentTimestamp =
+            uint256(Time.timestamp());
+
+        if (
+            currentTimestamp >=
+            unlockTime
+        ) {
+            return 0;
+        }
+
+        return
+            unlockTime -
+            currentTimestamp;
+    }
+
+    /// @notice Returns the nonce required by the next claim authorization.
+    /// @param account Recipient address whose nonce will be inspected.
+    /// @return claimNonce Nonce that must be included in the next authorization.
+    function getClaimNonce(
+        address account
+    )
+        external
+        view
+        returns (
+            uint256 claimNonce
+        )
+    {
+        return
+            _claimNonces[account];
+    }
+
+    /// @notice Returns the complete undistributed faucet allocation.
+    /// @dev
+    /// This value represents fixed faucet accounting only and is not the
+    /// live MINE balance held by this contract.
+    ///
+    /// @return remainingAllocation Complete M amount not yet distributed.
+    function getRemainingAllocation()
+        external
+        view
+        returns (
+            uint256 remainingAllocation
+        )
+    {
+        return
+            _FAUCET_ALLOCATION -
+            totalDistributed;
+    }
+
+    /// @notice Returns the live MINE balance currently held by this contract.
+    /// @dev
+    /// The live balance may differ from the remaining fixed allocation if
+    /// this contract is underfunded or overfunded.
+    ///
+    /// @return faucetTokenBalance Current MINE balance of this contract.
+    function getFaucetTokenBalance()
+        external
+        view
+        returns (
+            uint256 faucetTokenBalance
+        )
+    {
+        return
+            faucetToken.balanceOf(
+                address(this)
+            );
+    }
+
+    // =============================================================
+    //                             PAUSE
+    // =============================================================
+
+    /// @notice Activates the emergency faucet-claim pause.
+    /// @dev
+    /// Only the current owner may activate the pause.
+    ///
+    /// Pausing blocks new claims but does not modify recipient cooldowns,
+    /// nonces, distribution accounting, signer authority or expiration.
+    function pause()
+        external
+        onlyOwner
+    {
+        _pause();
+    }
+
+    /// @notice Deactivates the emergency faucet-claim pause.
+    /// @dev Only the current owner may restore normal faucet claims.
+    function unpause()
+        external
+        onlyOwner
+    {
+        _unpause();
+    }
+
+    // =============================================================
+    //                          OWNERSHIP
+    // =============================================================
+
+    /// @notice Permanently rejects ownership-renouncement attempts.
+    /// @dev
+    /// Ownable2Step remains available for controlled ownership transfers.
+    ///
+    /// Preventing renouncement ensures that emergency pause and
+    /// post-expiration token recovery can never become permanently
+    /// unreachable because of an accidental renounce transaction.
+    function renounceOwnership()
+        public
+        view
+        override
+        onlyOwner
+    {
+        revert OwnershipRenounceDisabled();
+    }
+
+    // =============================================================
+    //                    POST-EXPIRATION RECOVERY
+    // =============================================================
+
+    /// @notice
+    /// Recovers the complete remaining MINE balance after permanent faucet
+    /// expiration.
+    ///
+    /// @dev
+    /// Recovery is unavailable before 2026-11-01 00:00:00 UTC even when the
+    /// faucet is paused or its fixed distribution allocation is exhausted.
+    ///
+    /// The complete live MINE balance is transferred to the current owner.
+    /// This includes any amount resulting from accidental overfunding.
+    ///
+    /// The recovery path operates only on the immutable designated faucet
+    /// token and provides no generic arbitrary-token withdrawal mechanism.
+    ///
+    /// SafeERC20 is used for the external token transfer and ReentrancyGuard
+    /// protects the recovery path while the token contract is being called.
+    ///
+    /// Requirements:
+    /// - caller must be the current owner;
+    /// - permanent faucet expiration timestamp must have been reached;
+    /// - contract must hold a non-zero MINE balance.
+    function withdrawRemainingTokens()
+        external
+        onlyOwner
+        nonReentrant
+    {
+        uint256 currentTimestamp =
+            uint256(Time.timestamp());
+
+        if (
+            currentTimestamp <
+            _FAUCET_EXPIRATION
+        ) {
+            revert FaucetStillActive(
+                _FAUCET_EXPIRATION
+            );
+        }
+
+        uint256 balance =
+            faucetToken.balanceOf(
+                address(this)
+            );
+
+        if (balance == 0) {
+            revert NoTokensToWithdraw();
+        }
+
+        address tokenOwner =
+            owner();
+
+        faucetToken.safeTransfer(
+            tokenOwner,
+            balance
+        );
+
+        emit RemainingTokensWithdrawn(
+            tokenOwner,
+            balance
+        );
+    }
+
+    // =============================================================
+    //                    FALLBACK FUNCTIONS
+    // =============================================================
+
+    /// @notice Rejects direct native BNB transfers.
+    /// @dev
+    /// Native BNB is neither required nor accepted by this faucet contract.
+    /// Gas sponsorship is handled externally by the project relayer.
+    receive()
+        external
+        payable
+    {
+        revert DirectBNBTransferNotAllowed();
+    }
+
+    /// @notice Rejects unknown calls and direct native BNB transfers.
+    /// @dev
+    /// No generic fallback execution path is intentionally provided.
+    fallback()
+        external
+        payable
+    {
+        revert DirectBNBTransferNotAllowed();
+    }
+}
