@@ -6,12 +6,16 @@ import "@openzeppelin/contracts@5.7.0/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts@5.7.0/access/Ownable2Step.sol";
 import "@openzeppelin/contracts@5.7.0/utils/ReentrancyGuard.sol";
 
+/// @title 1M BLOCKS Staking Rewards Interface
+/// @author 1M BLOCKS
 /// @notice Interface required of a staking reward accounting contract.
 /// @dev
 /// The implementation must authorize this RewardVault as the caller,
 /// calculate the reward owed to `staker`, and consume that reward so it
 /// cannot be claimed twice. Reverted vault payments also revert consumption.
 interface IStakingRewards {
+    /// @notice Consumes the claimable staking reward for one participant.
+    /// @dev Only the authorized RewardVault should be permitted to call this function.
     /// @param staker Staking participant whose reward is being claimed.
     /// @return claimed Amount of MINE owed, using standard ERC20 units.
     function consumeClaim(
@@ -49,7 +53,11 @@ interface IStakingRewards {
 /// - The owner may register an untrusted staking contract while a slot is vacant.
 /// - A registered contract can report fabricated rewards and exhaust the vault.
 /// - This vault does not independently authenticate a service's reward calculations.
-/// - Direct native BNB transfers and unknown calls are rejected.
+/// - No receive or fallback function is implemented.
+/// - Native BNB transfers and unknown calls revert by default.
+/// - The two registered services share one MINE balance without per-service reserves.
+/// - Service contracts retain responsibility for preventing duplicate reward accounting.
+/// - Permanent registration fixes the address, not necessarily the service's internal logic.
 contract RewardVault is
     Ownable2Step,
     ReentrancyGuard
@@ -60,53 +68,63 @@ contract RewardVault is
     //                           CONSTANTS
     // =============================================================
 
+    /// @notice Maximum number of staking reward contracts that may ever be registered.
     /// @dev Lifetime upper bound for permanently registered reward contracts.
-    uint8 private constant _MAX_REWARDS_CONTRACTS =
+    uint256 private constant _MAX_REWARDS_CONTRACTS =
         2;
 
     // =============================================================
     //                             ERRORS
     // =============================================================
 
+    /// @notice Indicates that a required contract address is zero.
     /// @dev The supplied token or staking contract address is zero.
     error ZeroAddress();
 
+    /// @notice Indicates that the supplied address has no deployed contract code.
     /// @dev The supplied address does not contain deployed contract code.
+    /// @param account Address that failed the deployed-code validation.
     error AddressIsNotContract(
         address account
     );
 
+    /// @notice Indicates that both permanent registration slots are occupied.
     /// @dev Both permanent staking contract slots have already been filled.
     error RewardsSlotsFull();
 
+    /// @notice Indicates that a staking contract was registered previously.
     /// @dev The supplied staking contract is already registered.
     error DuplicateRewardsContract();
 
+    /// @notice Indicates that no service is registered in the requested slot.
     /// @dev The requested staking contract slot is not registered.
     error InvalidRewardsSlot();
 
+    /// @notice Indicates that a zero amount was submitted for reward funding.
     /// @dev Funding with a zero amount is not permitted.
     error ZeroFundingAmount();
 
+    /// @notice Indicates that permanent ownership renouncement is prohibited.
     /// @dev Renouncing ownership would prevent registration of vacant slots.
     error OwnershipRenounceDisabled();
-
-    /// @dev Direct native BNB transfers are intentionally unavailable.
-    error DirectBNBTransferNotAllowed();
 
     // =============================================================
     //                            STORAGE
     // =============================================================
 
+    /// @notice Immutable MINE token used for staking reward payments.
     /// @dev Immutable MINE ERC20 token held and distributed by this vault.
     IERC20 public immutable mineToken;
 
+    /// @notice Number of permanently occupied staking service slots.
     /// @dev Number of lifetime staking contracts permanently registered.
-    uint8 public registeredRewardsCount;
+    uint256 public registeredRewardsCount;
 
+    /// @notice Cumulative MINE staking rewards paid to participants.
     /// @dev Total MINE successfully transferred to staking participants.
     uint256 public totalDistributed;
 
+    /// @notice Two permanently assigned staking reward contract slots.
     /// @dev Two append-only slots containing reward accounting contracts.
     IStakingRewards[2] private _rewardsContracts;
 
@@ -115,14 +133,16 @@ contract RewardVault is
     // =============================================================
 
     /// @notice Emitted after a staking contract is registered permanently.
+    /// @dev Each slot emits this event at most once for the lifetime of the vault.
     /// @param slot Index of the newly occupied slot, either zero or one.
     /// @param rewardsContract Address of the registered staking contract.
     event RewardsContractRegistered(
-        uint8 indexed slot,
+        uint256 indexed slot,
         address indexed rewardsContract
     );
 
     /// @notice Emitted when MINE is deposited through fundRewards().
+    /// @dev Direct ERC20 transfers to the vault do not emit this event.
     /// @param funder Address supplying the MINE.
     /// @param amount Amount of MINE deposited.
     event RewardsFunded(
@@ -131,11 +151,12 @@ contract RewardVault is
     );
 
     /// @notice Emitted when a participant receives staking rewards.
+    /// @dev Emitted only after the corresponding MINE transfer succeeds.
     /// @param slot Registered service slot that accounted for the claim.
     /// @param staker Address receiving the MINE payment.
     /// @param claimed Amount of MINE transferred in this claim.
     event StakingRewardPaid(
-        uint8 indexed slot,
+        uint256 indexed slot,
         address indexed staker,
         uint256 claimed
     );
@@ -150,6 +171,7 @@ contract RewardVault is
     /// The deployer becomes owner and may permanently register up to two services.
     /// No staking service is registered or funded automatically at deployment.
     /// This contract never takes custody of a participant's staked principal.
+    /// The intended reserve is not enforced as a deployment or funding requirement.
     ///
     /// @param mineTokenAddress Deployed MINE ERC20 token contract address.
     constructor(
@@ -184,6 +206,8 @@ contract RewardVault is
     /// The registered service must implement IStakingRewards.consumeClaim().
     /// This vault cannot verify the integrity of the service's reward logic.
     /// Registration creates an irreversible payment authorization.
+    /// The two services draw rewards from the same undivided MINE balance.
+    /// Registering a proxy does not guarantee that its implementation stays fixed.
     ///
     /// Requirements:
     /// - caller must be the current owner;
@@ -198,7 +222,7 @@ contract RewardVault is
         external
         onlyOwner
     {
-        uint8 slot =
+        uint256 slot =
             registeredRewardsCount;
 
         if (slot >= _MAX_REWARDS_CONTRACTS) {
@@ -244,6 +268,7 @@ contract RewardVault is
     /// The caller must approve this vault to transfer the specified amount.
     /// Direct ERC20 transfers to this vault also increase its spendable balance.
     /// Funding is not restricted to the intended 100,000,000 MINE allocation.
+    /// Tokens received by direct transfer remain eligible for normal reward payouts.
     ///
     /// @param amount Amount of MINE to deposit.
     function fundRewards(
@@ -281,12 +306,14 @@ contract RewardVault is
     /// The service must also prevent the same rewards from being consumed twice.
     /// The vault never accepts a caller-supplied payment recipient or amount.
     /// A failed SafeERC20 transfer reverts the service's consumption atomically.
+    /// Insufficient vault funding also reverts both reward payment and consumption.
+    /// No balance or lifetime-allocation cap is imposed on an individual service.
     /// A zero reported reward performs no token transfer and is permitted.
     ///
     /// @param slot Permanently assigned service slot, either zero or one.
     /// @return claimed Amount of MINE successfully transferred to the caller.
     function claim(
-        uint8 slot
+        uint256 slot
     )
         external
         nonReentrant
@@ -328,10 +355,11 @@ contract RewardVault is
 
     /// @notice Returns the permanently registered contract in a service slot.
     /// @dev Reverts if the requested slot has not yet been registered.
+    /// Once registered, the returned address cannot be changed by this vault.
     /// @param slot Registered service slot, either zero or one.
     /// @return rewardsContract Address of the staking accounting contract.
     function getRewardsContract(
-        uint8 slot
+        uint256 slot
     )
         external
         view
@@ -345,6 +373,7 @@ contract RewardVault is
 
     /// @notice Returns the live MINE token balance held by the vault.
     /// @dev This is the actual balance, not a fixed allocation accounting value.
+    /// Direct ERC20 transfers can increase this balance without a funding event.
     /// @return vaultTokenBalance Current MINE balance at the vault address.
     function getVaultTokenBalance()
         external
@@ -366,6 +395,7 @@ contract RewardVault is
     /// @notice Rejects ownership renouncement to preserve unused slots.
     /// @dev
     /// Ownership may still be transferred using Ownable2Step.
+    /// Ownership renouncement remains disabled even after both slots are occupied.
     /// Neither the owner nor a successor can remove a registered service
     /// or transfer MINE through an administrative withdrawal function.
     function renounceOwnership()
@@ -381,13 +411,14 @@ contract RewardVault is
     //                       INTERNAL HELPERS
     // =============================================================
 
+    /// @notice Returns the accounting contract assigned to a registered slot.
     /// @dev
     /// Returns the reward accounting contract in a permanently occupied slot.
     /// Rejects unregistered slots before attempting any external service call.
     /// @param slot Slot to inspect.
     /// @return accounting Registered staking reward accounting contract.
     function _getRewardsContract(
-        uint8 slot
+        uint256 slot
     )
         internal
         view
@@ -401,27 +432,5 @@ contract RewardVault is
 
         return
             _rewardsContracts[slot];
-    }
-
-    // =============================================================
-    //                       FALLBACK FUNCTIONS
-    // =============================================================
-
-    /// @notice Rejects direct native BNB transfers.
-    /// @dev Reward payments use MINE ERC20 only.
-    receive()
-        external
-        payable
-    {
-        revert DirectBNBTransferNotAllowed();
-    }
-
-    /// @notice Rejects unknown calls and native BNB transfers.
-    /// @dev No generic fallback execution path is provided.
-    fallback()
-        external
-        payable
-    {
-        revert DirectBNBTransferNotAllowed();
     }
 }
