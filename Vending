@@ -4,29 +4,30 @@ pragma solidity 0.8.37;
 import "@openzeppelin/contracts@5.7.0/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts@5.7.0/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts@5.7.0/access/Ownable2Step.sol";
-import "@openzeppelin/contracts@5.7.0/utils/Pausable.sol";
 import "@openzeppelin/contracts@5.7.0/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts@5.7.0/utils/Pausable.sol";
 
 /// @title 1M BLOCKS MINE Vending
 /// @author 1M BLOCKS
-/// @notice Fixed-price MINE token vending contract on BNB Chain.
+/// @notice Fixed-price MINE token vending service on BNB Chain.
 /// @dev
 /// Overview:
-/// This contract sells previously minted MINE tokens for native BNB.
-/// Buyers select one of four permanently fixed purchase packages.
-/// Each successful purchase delivers MINE directly to the buyer.
+/// This contract sells existing MINE tokens for native BNB.
+/// Buyers select one of four permanently fixed packages and receive
+/// the corresponding MINE allocation immediately in the same transaction.
+/// The contract does not mint tokens or calculate exchange rates dynamically.
 ///
 /// Core design:
-/// - one permanently designated MINE token;
-/// - four fixed-price purchase packages;
+/// - one immutable MINE token reference;
+/// - four permanently fixed purchase packages;
 /// - exact native BNB payments;
-/// - immediate token delivery;
-/// - inventory-based sales without a total allocation cap;
-/// - unrestricted repeated purchases;
-/// - owner-managed funding and withdrawals;
-/// - temporary purchase suspension;
-/// - irreversible vending closure;
-/// - permanent on-chain purchase and closure records.
+/// - immediate delivery from available MINE inventory;
+/// - no total sale allocation or fundraising hard cap;
+/// - no whitelist, cooldown, or administrative wallet purchase limit;
+/// - owner-managed inventory deposits and asset withdrawals;
+/// - temporary suspension of purchases;
+/// - irreversible closure of the vending service;
+/// - cumulative purchase accounting and dedicated operational events.
 ///
 /// Fixed purchase packages:
 /// - Package 0: 0.02 BNB for 500 MINE;
@@ -35,48 +36,42 @@ import "@openzeppelin/contracts@5.7.0/utils/ReentrancyGuard.sol";
 /// - Package 3: 1 BNB for 25,000 MINE plus 5,000 bonus MINE.
 ///
 /// Security and operating properties:
-/// - The designated token address is permanently fixed.
-/// - Package prices and token quantities are encoded in bytecode.
-/// - No administrative function can modify the sale terms.
-/// - Purchases require exact payment and sufficient live inventory.
-/// - Every completed purchase transfers MINE in the same transaction.
-/// - Failed token delivery reverts payment and accounting updates.
-/// - No whitelist, blacklist, cooldown, or wallet purchase cap exists.
-/// - No fundraising hard cap or fixed inventory requirement exists.
-/// - The contract cannot mint MINE or reclaim tokens from buyers.
-/// - No vesting, delayed claim, or refund mechanism is implemented.
-/// - Managed deposits require prior ERC20 approval.
-/// - Ordinary direct MINE transfers also increase available inventory.
-/// - Direct transfers do not trigger vending-specific deposit events.
-/// - Only the current owner may perform managed deposits and withdrawals.
+/// - The designated MINE address is fixed during deployment.
+/// - Package prices, quantities, and bonuses cannot be modified.
+/// - Purchases require exact BNB payment and sufficient MINE inventory.
+/// - Payment, accounting, and token delivery execute atomically.
+/// - Failed MINE transfers revert the entire purchase transaction.
+/// - Purchased MINE is transferred directly to the buyer.
+/// - No minting, vesting, delayed claim, or refund mechanism exists.
+/// - Managed inventory deposits require prior ERC20 approval.
+/// - Direct MINE transfers may also increase available inventory.
+/// - Direct transfers do not emit the dedicated deposit event.
 /// - The owner may withdraw available MINE and BNB at any time.
-/// - Unrelated ERC20 assets may be recovered by the current owner.
-/// - MINE inventory is excluded from unrelated token recovery.
-/// - Temporary pausing blocks purchases without blocking withdrawals.
+/// - No minimum inventory or BNB reserve is enforced.
+/// - Unrelated ERC20 assets may be recovered by the owner.
+/// - MINE is excluded from unrelated ERC20 recovery.
+/// - Temporary pausing prevents purchases without blocking asset management.
 /// - Managed deposits remain available during temporary suspension.
-/// - Permanent closure blocks purchases and managed deposits forever.
-/// - Permanent closure cannot be reversed through ownership transfer.
-/// - Withdrawals and unrelated token recovery remain available after closure.
-/// - Historical records remain accessible after permanent closure.
+/// - Permanent closure disables purchases and managed deposits forever.
+/// - Permanent closure cannot be reversed by any subsequent owner.
+/// - Asset withdrawals remain available after permanent closure.
+/// - Historical accounting and event records remain accessible.
 /// - Ownable2Step protects administrative ownership transfers.
 /// - Ownership renouncement is permanently disabled.
-/// - ReentrancyGuard protects all external asset-moving functions.
-/// - SafeERC20 is used for all managed ERC20 token transfers.
-/// - Accounting updates precede external token delivery.
-/// - The underlying MINE token may independently suspend transfers.
-/// - A token-level pause may prevent funding, purchases, and withdrawals.
-/// - The owner controls unsold inventory and collected BNB.
-/// - No minimum token reserve or BNB withdrawal delay is enforced.
-/// - No proxy, upgrade mechanism, or adjustable sale terms exist.
-/// - Ordinary direct BNB transfers and unknown calls are rejected.
+/// - SafeERC20 handles all managed ERC20 transfers.
+/// - ReentrancyGuard protects external asset-moving functions.
+/// - Purchase accounting is updated before external token delivery.
+/// - The underlying MINE token may independently pause transfers.
+/// - A token-level pause may prevent deposits, purchases, and withdrawals.
+/// - No proxy, upgrade mechanism, or adjustable sale configuration exists.
+/// - Ordinary direct BNB transfers and unknown calls revert.
 /// - Forced native BNB transfers cannot be universally prevented.
-/// - Sale counters reflect completed purchases, not current asset balances.
-/// - Token funding and withdrawals do not modify historical sales.
-/// - Event records do not establish any future purchase entitlement.
+/// - Historical sale counters are independent of current asset balances.
+/// - Closing does not destroy the contract or erase transaction history.
 contract Vending is
     Ownable2Step,
-    Pausable,
-    ReentrancyGuard
+    ReentrancyGuard,
+    Pausable
 {
     using SafeERC20 for IERC20;
 
@@ -84,72 +79,66 @@ contract Vending is
     //                           CONSTANTS
     // =============================================================
 
-    /// @notice Address of the designated MINE token.
-    /// @dev
-    /// The address is compiled directly into the contract bytecode.
-    /// No administrative function can replace the designated token.
-    /// Deployment requires token code at this address.
-    address public constant MINE_TOKEN_ADDRESS =
-        0x20aF460A151ce67Dbe2bc095A6cEf2932fF7FCef;
-
-    /// @notice Unit multiplier used for MINE token quantities.
+    /// @notice Smallest-unit multiplier for MINE token quantities.
     /// @dev
     /// The designated MINE token uses 18 decimal places.
-    /// This constant converts whole-token package quantities
-    /// into the smallest ERC20 denomination.
-    uint256 private constant _TOKEN_UNIT =
-        1e18;
+    /// Package allocations are expressed in the token's smallest ERC20 unit.
+    /// This constant does not represent an exchange rate or adjustable price.
+    uint256 private constant _TOKEN_UNIT = 1e18;
 
     // =============================================================
-    //                            ERRORS
+    //                             ERRORS
     // =============================================================
 
-    /// @notice Reverts if the designated MINE address has no deployed code.
+    /// @notice Reverts when the designated MINE token has no deployed code.
     /// @dev
-    /// This check occurs during contract construction.
-    /// Existing bytecode does not independently prove ERC20 compatibility.
+    /// Used during construction before assigning the immutable token reference.
+    /// Code existence alone does not establish ERC20 compatibility.
     error TokenNotDeployed();
 
-    /// @notice Reverts when a selected purchase package does not exist.
+    /// @notice Reverts when the selected purchase package does not exist.
     /// @dev
-    /// Only package identifiers 0 through 3 are supported.
+    /// Only package identifiers 0, 1, 2, and 3 are supported.
+    /// No additional packages can be registered after deployment.
     ///
     /// @param packageId Unsupported package identifier.
     error InvalidPackage(
         uint8 packageId
     );
 
-    /// @notice Reverts when the supplied BNB differs from the required price.
+    /// @notice Reverts when the supplied BNB differs from the fixed package price.
     /// @dev
-    /// Both underpayment and overpayment are rejected.
-    /// The contract does not provide change or partial purchases.
+    /// Both insufficient and excess payments are rejected.
+    /// Partial purchases and automatic change are not supported.
     ///
-    /// @param provided Actual BNB supplied in wei.
-    /// @param required Required package payment in wei.
+    /// @param provided Actual native BNB supplied in wei.
+    /// @param required Required native BNB payment in wei.
     error IncorrectBNBAmount(
         uint256 provided,
         uint256 required
     );
 
-    /// @notice Reverts when an operation is prohibited after closure.
+    /// @notice Reverts when an operation is prohibited after permanent closure.
     /// @dev
-    /// Permanent closure blocks purchases, managed deposits,
-    /// repeated closure attempts, and reopening.
+    /// Permanent closure blocks purchases, managed deposits, reopening,
+    /// and repeated closure attempts.
+    /// Owner withdrawals and unrelated ERC20 recovery remain available.
     error VendingAlreadyClosed();
 
     /// @notice Reverts when a managed asset transfer specifies zero amount.
     /// @dev
-    /// Zero-value deposits, withdrawals, and recoveries are rejected.
+    /// Zero-value inventory deposits, withdrawals, and unrelated
+    /// ERC20 recovery operations are rejected.
     error ZeroAmount();
 
-    /// @notice Reverts when available MINE cannot cover a purchase.
+    /// @notice Reverts when available MINE inventory cannot cover a purchase.
     /// @dev
-    /// Required inventory includes both base and bonus MINE.
-    /// The comparison uses the token's current ERC20 balance.
-    /// A rejected purchase cannot retain the buyer's BNB.
+    /// Required inventory includes the complete base and bonus allocation.
+    /// Inventory is measured using the live ERC20 balance.
+    /// A rejected purchase does not retain the buyer's BNB payment.
     ///
-    /// @param required Total MINE required in smallest units.
-    /// @param available Available MINE in smallest units.
+    /// @param required Total MINE required in smallest ERC20 units.
+    /// @param available Current MINE inventory in smallest ERC20 units.
     error InsufficientInventory(
         uint256 required,
         uint256 available
@@ -157,132 +146,144 @@ contract Vending is
 
     /// @notice Reverts when a requested withdrawal exceeds available assets.
     /// @dev
-    /// Applies to MINE, native BNB, and unrelated ERC20 assets.
-    /// Values use the smallest denomination of the relevant asset.
+    /// Applies to native BNB, MINE, and unrelated ERC20 tokens.
+    /// Amounts are expressed in the smallest units of the relevant asset.
     ///
-    /// @param requested Requested withdrawal amount.
-    /// @param available Currently available asset balance.
+    /// @param requested Requested withdrawal or recovery amount.
+    /// @param available Current balance of the relevant asset.
     error InsufficientBalance(
         uint256 requested,
         uint256 available
     );
 
-    /// @notice Reverts when a required address is the zero address.
-    /// @dev Used to validate unrelated ERC20 recovery targets.
+    /// @notice Reverts when an address argument is the zero address.
+    /// @dev
+    /// Used to reject an invalid unrelated ERC20 recovery target.
     error ZeroAddress();
 
-    /// @notice Reverts when a target address has no deployed code.
+    /// @notice Reverts when an address contains no deployed contract code.
     /// @dev
-    /// Contract code presence does not establish interface compatibility.
+    /// Code-length validation does not guarantee ERC20 compatibility.
+    /// An incompatible target may still revert during an external call.
     ///
-    /// @param account Address that failed validation.
+    /// @param account Address that failed the code-length validation.
     error AddressIsNotContract(
         address account
     );
 
-    /// @notice Reverts when MINE is selected for unrelated token recovery.
-    /// @dev MINE inventory must be withdrawn using withdrawTokens().
+    /// @notice Reverts when MINE is selected for unrelated ERC20 recovery.
+    /// @dev
+    /// MINE inventory must be withdrawn through withdrawTokens().
+    /// This keeps inventory withdrawal records separate from recovery records.
     error CannotRecoverMINE();
 
-    /// @notice Reverts when native BNB transfer to the owner fails.
-    /// @dev A failed transfer reverts the complete withdrawal transaction.
+    /// @notice Reverts when a native BNB withdrawal transfer fails.
+    /// @dev
+    /// A failed native transfer reverts the complete withdrawal.
+    /// No successful withdrawal event remains after the revert.
     error BNBTransferFailed();
 
-    /// @notice Reverts when ownership renouncement is attempted.
+    /// @notice Reverts when the owner attempts to renounce ownership.
     /// @dev
-    /// Ownership is preserved to maintain administrative recovery access.
+    /// Ownership remains necessary for inventory withdrawals,
+    /// native BNB withdrawals, and recovery of unrelated ERC20 assets.
     error OwnershipRenounceDisabled();
 
-    /// @notice Reverts on unsupported direct BNB transfers or unknown calls.
+    /// @notice Reverts on ordinary direct BNB transfers or unknown calls.
     /// @dev
-    /// Purchases must explicitly invoke buy() with a valid package.
-    /// Forced native transfers may bypass ordinary receive handling.
+    /// Valid purchases must explicitly invoke buy() with a package identifier.
+    /// Forced native BNB transfers cannot be prevented universally.
     error DirectBNBTransferNotAllowed();
 
     // =============================================================
-    //                           STORAGE
+    //                            STORAGE
     // =============================================================
 
-    /// @notice Immutable reference to the designated MINE token.
+    /// @notice Immutable MINE token reference used for all token operations.
     /// @dev
-    /// Initialized once during construction.
-    /// Used for all managed inventory movements and buyer payouts.
-    /// Cannot be replaced after deployment.
+    /// Assigned once during construction.
+    /// Used for inventory queries, deposits, purchases, and withdrawals.
+    /// No owner function can replace the designated token contract.
     IERC20 public immutable mineToken;
 
-    /// @notice Indicates whether vending has permanently closed.
+    /// @notice Whether the vending service has permanently closed.
     /// @dev
-    /// Initially false.
-    /// Can change to true only once through closeVending().
-    /// No function can restore the previous state.
+    /// Initially false and set to true only by closeVending().
+    /// No function can restore the open state after permanent closure.
+    /// Asset withdrawal authority remains available regardless of this value.
     bool public vendingClosed;
 
-    /// @notice Cumulative BNB received from successful purchases.
+    /// @notice Cumulative BNB received from completed purchases.
     /// @dev
-    /// Increased only by successfully completed buy() calls.
-    /// Withdrawals do not decrease this historical counter.
-    /// Forced BNB transfers are excluded from sale accounting.
+    /// Increased only by successful buy() transactions.
+    /// Owner withdrawals do not decrease this historical counter.
+    /// BNB received outside purchases is excluded from sale accounting.
     uint256 public totalBNBRaised;
 
-    /// @notice Cumulative base MINE sold through successful purchases.
+    /// @notice Cumulative base MINE sold through completed purchases.
     /// @dev
-    /// Excludes bonus tokens.
-    /// Deposits and inventory withdrawals do not affect this counter.
+    /// Excludes bonus MINE.
+    /// Funding and inventory withdrawals do not modify this value.
+    /// The value is cumulative rather than a current inventory balance.
     uint256 public totalTokensSold;
 
     /// @notice Cumulative bonus MINE distributed through purchases.
     /// @dev
-    /// Increased only when a completed purchase includes bonus MINE.
-    /// Remains unchanged by deposits and owner withdrawals.
+    /// Increased only by successfully completed bonus-bearing purchases.
+    /// Deposits and withdrawals do not change this historical amount.
     uint256 public totalBonusDistributed;
 
-    /// @notice Number of completed purchase transactions.
+    /// @notice Number of successfully completed purchase transactions.
     /// @dev
-    /// Each successful buy() call increments this value once.
-    /// Failed transactions cannot increment the counter.
-    /// Repeated purchases by the same wallet are counted separately.
+    /// Increased once per successful buy() invocation.
+    /// Reverted purchases cannot modify this counter.
+    /// Multiple purchases by one address are counted separately.
     uint256 public totalPurchases;
 
     /// @notice Lifetime purchase accounting for an individual buyer.
     /// @dev
-    /// The structure uses two 256-bit storage slots.
+    /// The structure occupies two 256-bit storage slots.
     ///
     /// Storage layout:
-    /// - contributedBNB occupies one uint256 slot;
+    /// - contributedBNB occupies one complete uint256 slot;
     /// - receivedTokens and purchases share the second slot.
     ///
-    /// Amounts use their respective smallest asset units.
-    /// All arithmetic remains checked.
-    /// The narrower fields have finite numeric limits.
-    /// These limits are not configurable purchase restrictions.
+    /// contributedBNB records cumulative BNB payments in wei.
+    /// receivedTokens records MINE delivered in smallest ERC20 units.
+    /// purchases records the number of completed buy() transactions.
+    ///
+    /// All arithmetic is checked for overflow.
+    /// Narrower fields have finite numerical ranges.
+    /// These limits are not administrator-configurable purchase restrictions.
     struct BuyerInfo {
         uint256 contributedBNB;
         uint128 receivedTokens;
         uint128 purchases;
     }
 
-    /// @notice Stores historical purchases by buyer address.
+    /// @notice Stores historical purchase accounting by buyer address.
     /// @dev
-    /// Values change only during successfully completed purchases.
-    /// Records are not erased by suspension, withdrawal, or closure.
+    /// Updated only through successful purchases.
+    /// Historical records remain available after suspension and closure.
+    /// Asset withdrawals do not modify buyer purchase history.
     mapping(address => BuyerInfo) private _buyerInfo;
 
     // =============================================================
-    //                            EVENTS
+    //                             EVENTS
     // =============================================================
 
-    /// @notice Emitted following successful MINE delivery to a buyer.
+    /// @notice Emitted when a buyer successfully purchases and receives MINE.
     /// @dev
-    /// Exactly one event is emitted for each completed purchase.
-    /// Event emission occurs after the SafeERC20 transfer succeeds.
-    /// Failed purchases revert all associated state and event changes.
+    /// Each completed purchase emits exactly one event.
+    /// Base and bonus quantities are recorded separately.
+    /// A failed transfer reverts the transaction and prevents event retention.
     ///
     /// @param buyer Address that paid BNB and received MINE.
-    /// @param packageId Purchased package identifier.
-    /// @param bnbPaid Native BNB payment in wei.
-    /// @param baseAmount Base MINE delivered in smallest units.
-    /// @param bonusAmount Bonus MINE delivered in smallest units.
-    /// @param totalAmount Combined MINE delivered in smallest units.
+    /// @param packageId Selected fixed purchase package.
+    /// @param bnbPaid Native BNB received in wei.
+    /// @param baseAmount Base MINE delivered in smallest ERC20 units.
+    /// @param bonusAmount Bonus MINE delivered in smallest ERC20 units.
+    /// @param totalAmount Combined MINE delivered in smallest ERC20 units.
     event TokensPurchased(
         address indexed buyer,
         uint8 indexed packageId,
@@ -292,26 +293,26 @@ contract Vending is
         uint256 totalAmount
     );
 
-    /// @notice Emitted after a successful managed inventory deposit.
+    /// @notice Emitted after a successful managed MINE inventory deposit.
     /// @dev
-    /// Only deposits completed through depositTokens() emit this event.
-    /// Ordinary direct ERC20 transfers do not trigger it.
-    /// A failed transferFrom cannot produce a committed deposit event.
+    /// Only depositTokens() emits this event.
+    /// Direct ERC20 transfers do not trigger the dedicated deposit event.
+    /// A failed transferFrom cannot produce a committed deposit record.
     ///
-    /// @param depositor Owner address supplying MINE.
-    /// @param amount Deposited MINE in smallest units.
+    /// @param depositor Owner address supplying MINE inventory.
+    /// @param amount MINE deposited in smallest ERC20 units.
     event TokensDeposited(
         address indexed depositor,
         uint256 amount
     );
 
-    /// @notice Emitted after a successful MINE inventory withdrawal.
+    /// @notice Emitted after a successful owner withdrawal of MINE.
     /// @dev
-    /// The event reports tokens transferred from vending to the owner.
-    /// It does not reduce or modify historical sale counters.
+    /// Records a managed inventory withdrawal.
+    /// Historical purchase accounting remains unchanged.
     ///
     /// @param recipient Owner address receiving MINE.
-    /// @param amount Withdrawn MINE in smallest units.
+    /// @param amount MINE withdrawn in smallest ERC20 units.
     event TokensWithdrawn(
         address indexed recipient,
         uint256 amount
@@ -319,11 +320,11 @@ contract Vending is
 
     /// @notice Emitted after a successful native BNB withdrawal.
     /// @dev
-    /// The event reports the amount transferred to the current owner.
-    /// It does not change cumulative BNB sales accounting.
+    /// Records the BNB amount transferred to the owner.
+    /// Historical BNB sales remain unchanged after withdrawal.
     ///
-    /// @param recipient Owner address receiving BNB.
-    /// @param amount Withdrawn BNB in wei.
+    /// @param recipient Owner address receiving native BNB.
+    /// @param amount Native BNB withdrawn in wei.
     event BNBWithdrawn(
         address indexed recipient,
         uint256 amount
@@ -331,28 +332,28 @@ contract Vending is
 
     /// @notice Emitted after recovering an unrelated ERC20 asset.
     /// @dev
-    /// Recovery does not change historical MINE purchase accounting.
     /// The designated MINE token cannot be recovered through this path.
+    /// Recovery does not affect MINE purchase accounting.
     ///
     /// @param token Address of the recovered ERC20 contract.
-    /// @param recipient Owner receiving recovered tokens.
-    /// @param amount Recovered quantity in the token's smallest units.
+    /// @param recipient Owner address receiving the recovered asset.
+    /// @param amount Recovered amount in the asset's smallest units.
     event ERC20Recovered(
         address indexed token,
         address indexed recipient,
         uint256 amount
     );
 
-    /// @notice Emitted exactly once upon permanent vending closure.
+    /// @notice Emitted exactly once upon irreversible vending closure.
     /// @dev
-    /// Captures final cumulative purchase statistics.
-    /// The closure operation does not move or destroy any assets.
-    /// Historical event records remain accessible after closure.
+    /// Captures cumulative sale statistics at the moment of closure.
+    /// Subsequent withdrawals do not change the recorded sale history.
+    /// Closure does not transfer assets or destroy the contract.
     ///
-    /// @param closedBy Owner initiating closure.
-    /// @param closedAt Block timestamp of closure.
-    /// @param bnbRaised Cumulative BNB collected from purchases.
-    /// @param tokensDistributed Cumulative MINE delivered to buyers.
+    /// @param closedBy Owner address initiating permanent closure.
+    /// @param closedAt Block timestamp of permanent closure.
+    /// @param bnbRaised Cumulative BNB collected through purchases.
+    /// @param tokensDistributed Total base and bonus MINE delivered.
     /// @param purchases Number of completed purchase transactions.
     event VendingClosed(
         address indexed closedBy,
@@ -369,27 +370,32 @@ contract Vending is
     /// @notice Deploys the fixed-price MINE vending contract.
     /// @dev
     /// Deployment requirements:
-    /// - the designated MINE address must have deployed contract code.
+    /// - the designated MINE address must contain deployed contract code.
     ///
     /// Post-deployment state:
     /// - the deployer becomes the initial owner;
-    /// - mineToken references the designated MINE contract;
+    /// - the token reference is assigned permanently;
     /// - vendingClosed is false;
-    /// - all purchase counters are initialized to zero;
-    /// - no inventory is automatically deposited;
-    /// - purchasing is initially unpaused.
+    /// - purchases are initially unpaused;
+    /// - cumulative accounting counters are initialized to zero;
+    /// - no token inventory is deposited automatically.
     ///
-    /// The code-length check does not independently validate
-    /// token behavior, decimals, or compatibility.
+    /// Token compatibility:
+    /// The designated token is expected to use 18 decimals and
+    /// standard ERC20 transfers without a transfer tax.
+    /// Code existence alone does not verify these properties.
     constructor()
         Ownable(msg.sender)
     {
-        if (MINE_TOKEN_ADDRESS.code.length == 0) {
+        address tokenAddress =
+            0x20aF460A151ce67Dbe2bc095A6cEf2932fF7FCef;
+
+        if (tokenAddress.code.length == 0) {
             revert TokenNotDeployed();
         }
 
         mineToken =
-            IERC20(MINE_TOKEN_ADDRESS);
+            IERC20(tokenAddress);
     }
 
     // =============================================================
@@ -399,35 +405,34 @@ contract Vending is
     /// @notice Purchases one fixed MINE package using native BNB.
     /// @dev
     /// Purchase requirements:
-    /// - vending must not be permanently closed;
-    /// - purchasing must not be temporarily paused;
-    /// - the selected package must exist;
-    /// - msg.value must exactly equal the package price;
-    /// - available inventory must cover base and bonus MINE.
+    /// - the vending service must not be permanently closed;
+    /// - purchases must not be temporarily paused;
+    /// - the selected package identifier must be valid;
+    /// - msg.value must match the exact package price;
+    /// - available MINE inventory must cover base and bonus tokens.
     ///
-    /// Execution sequence:
-    /// - resolve the fixed package terms;
-    /// - validate the exact payment amount;
-    /// - verify available inventory;
-    /// - update historical buyer accounting;
-    /// - update cumulative global sale counters;
-    /// - transfer MINE directly to the purchaser;
-    /// - emit TokensPurchased after successful delivery.
+    /// Purchase behavior:
+    /// - the package identifier determines the fixed payment and payout;
+    /// - exact BNB payment and live MINE inventory are validated;
+    /// - buyer and global cumulative records are updated;
+    /// - the complete MINE allocation is transferred to msg.sender;
+    /// - TokensPurchased is emitted after successful token delivery.
     ///
     /// Atomicity:
-    /// - invalid inputs revert without completing a purchase;
-    /// - insufficient inventory reverts the transaction;
-    /// - token transfer failure rolls back accounting and payment;
-    /// - no partial token payout or retained BNB is committed.
+    /// - invalid packages or incorrect payments revert;
+    /// - insufficient inventory prevents purchase completion;
+    /// - token transfer failure reverts all accounting changes;
+    /// - failed purchases do not retain the buyer's BNB;
+    /// - no partially completed purchase remains committed.
     ///
-    /// Operational limitations:
-    /// - token recipients cannot be specified independently;
+    /// Limitations:
     /// - arbitrary purchase quantities are not supported;
-    /// - purchases are not subject to administrative wallet limits;
-    /// - finite integer ranges remain subject to checked arithmetic;
-    /// - independent MINE token pausing may block delivery.
+    /// - purchasers cannot select an alternative token recipient;
+    /// - no administrative wallet purchase cap is enforced;
+    /// - finite integer ranges remain subject to overflow checks;
+    /// - MINE token-level pausing may prevent delivery.
     ///
-    /// @param packageId Selected fixed package identifier from 0 to 3.
+    /// @param packageId Fixed package identifier from 0 through 3.
     function buy(
         uint8 packageId
     )
@@ -472,17 +477,10 @@ contract Vending is
         buyer.contributedBNB +=
             msg.value;
 
-        uint128 newReceivedTokens =
-            buyer.receivedTokens + uint128(totalAmount);
+        buyer.receivedTokens +=
+            uint128(totalAmount);
 
-        uint128 newPurchases =
-            buyer.purchases + 1;
-
-        buyer.receivedTokens =
-            newReceivedTokens;
-
-        buyer.purchases =
-            newPurchases;
+        ++buyer.purchases;
 
         totalBNBRaised +=
             msg.value;
@@ -511,31 +509,31 @@ contract Vending is
     }
 
     // =============================================================
-    //                       FUNDING FUNCTION
+    //                        FUNDING FUNCTION
     // =============================================================
 
-    /// @notice Deposits additional MINE inventory from the current owner.
+    /// @notice Deposits MINE inventory from the current owner.
     /// @dev
-    /// Requirements:
-    /// - caller must be the current owner;
+    /// Funding requirements:
+    /// - the caller must be the current owner;
     /// - vending must not be permanently closed;
-    /// - amount must be greater than zero;
+    /// - the requested deposit amount must be non-zero;
     /// - sufficient allowance and transferable MINE must exist.
     ///
     /// Funding behavior:
-    /// - the owner approves the vending contract beforehand;
-    /// - safeTransferFrom moves MINE into vending custody;
-    /// - a successful managed deposit emits TokensDeposited;
-    /// - inventory has no configured minimum or maximum.
+    /// - the owner approves vending through the MINE token contract;
+    /// - SafeERC20 transfers MINE into vending custody;
+    /// - successful managed funding emits TokensDeposited;
+    /// - no cumulative funding target or inventory cap is enforced.
     ///
-    /// Limitations:
-    /// - temporary vending suspension does not block deposits;
-    /// - permanent closure prevents managed deposits;
+    /// Important limitations:
+    /// - deposits remain available while purchasing is paused;
+    /// - managed deposits become unavailable after permanent closure;
     /// - direct ERC20 transfers may still increase inventory;
     /// - direct transfers do not emit TokensDeposited;
-    /// - the MINE token's own pause may prevent funding.
+    /// - MINE token-level pausing may prevent funding.
     ///
-    /// @param amount MINE to deposit in smallest ERC20 units.
+    /// @param amount MINE quantity in smallest ERC20 units.
     function depositTokens(
         uint256 amount
     )
@@ -567,17 +565,17 @@ contract Vending is
     //                         VIEW FUNCTIONS
     // =============================================================
 
-    /// @notice Returns the permanent terms of a purchase package.
+    /// @notice Returns the fixed purchase terms of a package.
     /// @dev
-    /// The values are determined entirely by fixed contract logic.
-    /// This function does not check current inventory or sale status.
-    /// Unsupported package identifiers revert.
+    /// Package values are encoded directly in the contract logic.
+    /// The function does not check current inventory or operating status.
+    /// Unsupported identifiers revert without returning package terms.
     ///
-    /// @param packageId Package identifier from 0 to 3.
-    /// @return bnbPrice Exact BNB payment in wei.
-    /// @return baseAmount Base MINE quantity in smallest units.
-    /// @return bonusAmount Bonus MINE quantity in smallest units.
-    /// @return totalAmount Combined MINE quantity in smallest units.
+    /// @param packageId Package identifier from 0 through 3.
+    /// @return bnbPrice Required native BNB payment in wei.
+    /// @return baseAmount Base MINE in smallest ERC20 units.
+    /// @return bonusAmount Bonus MINE in smallest ERC20 units.
+    /// @return totalAmount Combined MINE in smallest ERC20 units.
     function getPackage(
         uint8 packageId
     )
@@ -600,13 +598,13 @@ contract Vending is
             baseAmount + bonusAmount;
     }
 
-    /// @notice Returns cumulative MINE delivered through purchases.
+    /// @notice Returns cumulative base and bonus MINE distributed.
     /// @dev
-    /// The value combines historical base and bonus distributions.
-    /// It is calculated without maintaining redundant storage.
-    /// Deposits and withdrawals do not modify this purchase total.
+    /// The total is derived from existing historical purchase counters.
+    /// No separate storage slot is used for this combined quantity.
+    /// Inventory funding and withdrawals do not modify the result.
     ///
-    /// @return distributed Total MINE delivered in smallest units.
+    /// @return distributed Total MINE delivered in smallest ERC20 units.
     function totalTokensDistributed()
         external
         view
@@ -619,13 +617,14 @@ contract Vending is
             totalBonusDistributed;
     }
 
-    /// @notice Returns the actual MINE balance held by vending.
+    /// @notice Returns the current MINE inventory held by vending.
     /// @dev
-    /// Includes managed deposits and ordinary direct ERC20 transfers.
-    /// Inventory remains subject to owner withdrawals.
-    /// This view does not guarantee inventory for pending purchases.
+    /// Uses the live ERC20 balance at the vending contract address.
+    /// Includes managed deposits and ordinary direct token transfers.
+    /// Inventory may be reduced through subsequent owner withdrawals.
+    /// This view does not reserve inventory for pending purchases.
     ///
-    /// @return inventory Available MINE in smallest units.
+    /// @return inventory Available MINE in smallest ERC20 units.
     function getInventory()
         external
         view
@@ -639,14 +638,14 @@ contract Vending is
             );
     }
 
-    /// @notice Returns historical purchase information for a wallet.
+    /// @notice Returns cumulative purchase accounting for one buyer.
     /// @dev
-    /// Only completed purchase transactions affect this record.
-    /// Addresses without purchases return zero-valued fields.
-    /// Historical data remains accessible after permanent closure.
+    /// Only completed buy() transactions update this record.
+    /// An address without purchases returns zero-valued fields.
+    /// Historical information remains accessible after closure.
     ///
-    /// @param buyer Address whose purchase data is requested.
-    /// @return info Cumulative BNB, MINE, and purchase count.
+    /// @param buyer Wallet address whose purchase history is requested.
+    /// @return info Cumulative BNB, received MINE, and purchase count.
     function getBuyerInfo(
         address buyer
     )
@@ -660,11 +659,11 @@ contract Vending is
             _buyerInfo[buyer];
     }
 
-    /// @notice Returns native BNB currently held by vending.
+    /// @notice Returns the current native BNB balance of vending.
     /// @dev
-    /// This includes unwithdrawn purchase proceeds.
-    /// Forced native transfers may also affect this balance.
-    /// It is not necessarily equal to historical BNB sales.
+    /// The balance includes unwithdrawn purchase proceeds.
+    /// It may also include native BNB received through forced transfers.
+    /// It is not necessarily equal to cumulative sales minus withdrawals.
     ///
     /// @return balance Current native BNB balance in wei.
     function getBNBBalance()
@@ -682,11 +681,11 @@ contract Vending is
     //                         ADMIN FUNCTIONS
     // =============================================================
 
-    /// @notice Temporarily suspends purchases.
+    /// @notice Temporarily suspends new MINE purchases.
     /// @dev
-    /// Only the current owner may invoke this function.
-    /// OpenZeppelin Pausable emits Paused upon successful suspension.
-    /// Deposits, withdrawals, recovery, and closure remain available.
+    /// Only the current owner may pause vending.
+    /// The inherited Pausable implementation emits Paused.
+    /// Funding, withdrawals, recovery, and closure remain available.
     /// This operation does not pause the underlying MINE token.
     function pause()
         external
@@ -695,12 +694,12 @@ contract Vending is
         _pause();
     }
 
-    /// @notice Resumes purchases after temporary suspension.
+    /// @notice Resumes purchasing after temporary suspension.
     /// @dev
-    /// Only the current owner may invoke this function.
-    /// Permanent closure prevents reopening.
-    /// OpenZeppelin Pausable emits Unpaused upon successful resumption.
-    /// This operation does not override the MINE token's pause status.
+    /// Only the current owner may resume purchases.
+    /// Permanently closed vending cannot be reopened.
+    /// The inherited Pausable implementation emits Unpaused.
+    /// A separate MINE token pause may still prevent token delivery.
     function unpause()
         external
         onlyOwner
@@ -714,23 +713,23 @@ contract Vending is
 
     /// @notice Withdraws available MINE inventory to the current owner.
     /// @dev
-    /// Requirements:
-    /// - caller must be the current owner;
-    /// - amount must be greater than zero;
-    /// - the contract must hold sufficient MINE.
+    /// Withdrawal requirements:
+    /// - the caller must be the current owner;
+    /// - the amount must be greater than zero;
+    /// - actual MINE inventory must cover the requested amount.
     ///
     /// Withdrawal behavior:
-    /// - SafeERC20 transfers MINE to the current owner;
-    /// - successful withdrawal emits TokensWithdrawn;
+    /// - SafeERC20 transfers MINE directly to the current owner;
+    /// - successful withdrawals emit TokensWithdrawn;
     /// - failed transfers revert the complete operation;
-    /// - purchase counters remain unchanged.
+    /// - historical purchase accounting remains unchanged.
     ///
-    /// Limitations:
-    /// - withdrawals are possible while paused or closed;
-    /// - tokens held in buyer wallets cannot be withdrawn;
-    /// - MINE token-level pausing may prevent movement.
+    /// Important limitations:
+    /// - withdrawals remain available while paused or permanently closed;
+    /// - previously purchased tokens cannot be reclaimed from buyers;
+    /// - MINE token-level pausing may prevent withdrawals.
     ///
-    /// @param amount MINE to withdraw in smallest units.
+    /// @param amount MINE quantity in smallest ERC20 units.
     function withdrawTokens(
         uint256 amount
     )
@@ -768,22 +767,22 @@ contract Vending is
 
     /// @notice Withdraws native BNB to the current owner.
     /// @dev
-    /// Requirements:
-    /// - caller must be the current owner;
-    /// - requested amount must be non-zero;
+    /// Withdrawal requirements:
+    /// - the caller must be the current owner;
+    /// - the requested amount must be non-zero;
     /// - sufficient native BNB must be available.
     ///
     /// Withdrawal behavior:
-    /// - BNB is transferred using a checked native call;
-    /// - ReentrancyGuard protects the external call path;
-    /// - successful transfer emits BNBWithdrawn;
-    /// - failed transfer reverts the transaction;
-    /// - cumulative sales remain unchanged.
+    /// - a checked native call transfers BNB to the current owner;
+    /// - ReentrancyGuard protects the external transfer path;
+    /// - failed transfers revert the complete withdrawal;
+    /// - successful transfers emit BNBWithdrawn;
+    /// - historical BNB sales remain unchanged.
     ///
-    /// Limitations:
-    /// - no sale closure or minimum reserve is required;
+    /// Important limitations:
+    /// - no sale closure or minimum BNB reserve is required;
     /// - withdrawals remain available after permanent closure;
-    /// - a contract-based owner must accept native BNB.
+    /// - a contract-based owner must be able to receive native BNB.
     ///
     /// @param amount Native BNB to withdraw in wei.
     function withdrawBNB(
@@ -827,26 +826,26 @@ contract Vending is
 
     /// @notice Recovers an unrelated ERC20 asset held by vending.
     /// @dev
-    /// Requirements:
-    /// - caller must be the current owner;
-    /// - token address must be non-zero and contain deployed code;
+    /// Recovery requirements:
+    /// - the caller must be the current owner;
+    /// - the recovery target must be non-zero and contain deployed code;
     /// - the designated MINE token must not be selected;
-    /// - amount must be greater than zero;
-    /// - sufficient recoverable tokens must be available.
+    /// - the requested amount must be non-zero;
+    /// - the contract must hold sufficient recoverable tokens.
     ///
     /// Recovery behavior:
-    /// - SafeERC20 transfers the specified asset to the current owner;
-    /// - successful recovery emits ERC20Recovered;
+    /// - SafeERC20 transfers the selected asset to the current owner;
+    /// - a successful recovery emits ERC20Recovered;
     /// - failed transfers revert the complete operation;
-    /// - recovery does not change historical MINE sales.
+    /// - historical MINE purchase accounting remains unchanged.
     ///
-    /// Limitations:
-    /// - unrelated token recovery remains available after closure;
-    /// - recovery cannot access arbitrary third-party wallets;
+    /// Important limitations:
+    /// - unrelated ERC20 recovery remains available after closure;
+    /// - this function cannot access arbitrary third-party wallets;
     /// - deployed code does not guarantee ERC20 compatibility.
     ///
-    /// @param token Address of the unrelated ERC20 asset.
-    /// @param amount Recovery amount in the token's smallest units.
+    /// @param token Address of the unrelated ERC20 contract.
+    /// @param amount Recovery quantity in the token's smallest units.
     function recoverERC20(
         address token,
         uint256 amount
@@ -859,7 +858,7 @@ contract Vending is
             revert ZeroAddress();
         }
 
-        if (token == MINE_TOKEN_ADDRESS) {
+        if (token == address(mineToken)) {
             revert CannotRecoverMINE();
         }
 
@@ -905,29 +904,30 @@ contract Vending is
     //                       PERMANENT CLOSURE
     // =============================================================
 
-    /// @notice Irreversibly closes the MINE vending service.
+    /// @notice Irreversibly closes the vending service.
     /// @dev
-    /// Requirements:
-    /// - caller must be the current owner;
+    /// Closure requirements:
+    /// - only the current owner may initiate permanent closure;
     /// - vending must not already be permanently closed.
     ///
     /// Closure behavior:
     /// - vendingClosed is permanently set to true;
-    /// - new purchases and managed deposits become unavailable;
-    /// - unpause() cannot reopen the contract;
-    /// - VendingClosed records cumulative purchase statistics;
-    /// - no tokens or native BNB are transferred during closure.
+    /// - subsequent purchases become unavailable;
+    /// - future managed deposits become unavailable;
+    /// - unpause() cannot reopen the vending service;
+    /// - VendingClosed records cumulative completed sales;
+    /// - no MINE or native BNB is transferred during closure.
     ///
     /// Post-closure behavior:
-    /// - historical purchase records remain accessible;
+    /// - historical purchase accounting remains accessible;
     /// - the owner may withdraw remaining MINE and BNB;
     /// - unrelated ERC20 recovery remains available;
-    /// - ownership transfers remain possible;
-    /// - direct ERC20 transfers may still reach the address;
-    /// - the contract and its previous events remain on-chain.
+    /// - controlled ownership transfers remain possible;
+    /// - direct ERC20 transfers may still reach this address;
+    /// - previous transaction and event records remain on-chain.
     ///
-    /// This function may successfully execute only once.
-    /// Closure cannot be reversed by any future owner.
+    /// Permanent closure can complete successfully only once.
+    /// No subsequent owner can reverse the closed state.
     function closeVending()
         external
         onlyOwner
@@ -949,17 +949,17 @@ contract Vending is
     }
 
     // =============================================================
-    //                          OWNERSHIP
+    //                           OWNERSHIP
     // =============================================================
 
     /// @notice Permanently disables ownership renouncement.
     /// @dev
-    /// Ownable2Step remains available for controlled ownership changes.
-    /// Renouncement is prohibited to preserve asset recovery access.
-    /// Ownership changes never modify fixed purchase terms.
-    /// New owners cannot reverse permanent vending closure.
+    /// Controlled ownership transfers remain possible through Ownable2Step.
+    /// Renouncement is prohibited to preserve asset withdrawal authority.
+    /// Ownership changes cannot alter fixed package conditions.
+    /// Permanent closure cannot be reversed by a subsequent owner.
     ///
-    /// This function always reverts for the current owner.
+    /// This function always reverts for an authorized owner.
     function renounceOwnership()
         public
         view
@@ -973,22 +973,23 @@ contract Vending is
     //                       INTERNAL HELPERS
     // =============================================================
 
-    /// @notice Resolves the permanently fixed terms of a package.
+    /// @notice Resolves the permanently fixed terms of a purchase package.
     /// @dev
-    /// The function returns values encoded directly in bytecode.
-    /// Package conditions do not depend on mutable storage.
-    /// Unsupported identifiers revert with InvalidPackage.
+    /// All prices and token allocations are encoded directly in contract code.
+    /// No administrative function or mutable storage can change these values.
     ///
-    /// Package identifiers:
-    /// - 0: 0.02 BNB, 500 MINE;
-    /// - 1: 0.08 BNB, 2,000 MINE;
-    /// - 2: 0.2 BNB, 5,000 base MINE, 500 bonus MINE;
-    /// - 3: 1 BNB, 25,000 base MINE, 5,000 bonus MINE.
+    /// Package allocation:
+    /// - 0: 0.02 BNB for 500 MINE;
+    /// - 1: 0.08 BNB for 2,000 MINE;
+    /// - 2: 0.2 BNB for 5,000 base and 500 bonus MINE;
+    /// - 3: 1 BNB for 25,000 base and 5,000 bonus MINE.
     ///
-    /// @param packageId Selected package identifier.
-    /// @return bnbPrice Required BNB payment in wei.
-    /// @return baseAmount Base MINE in smallest units.
-    /// @return bonusAmount Bonus MINE in smallest units.
+    /// Invalid package identifiers revert without returning package terms.
+    ///
+    /// @param packageId Fixed package identifier from 0 through 3.
+    /// @return bnbPrice Required native BNB in wei.
+    /// @return baseAmount Base MINE in smallest ERC20 units.
+    /// @return bonusAmount Bonus MINE in smallest ERC20 units.
     function _getPackage(
         uint8 packageId
     )
@@ -1038,13 +1039,13 @@ contract Vending is
     }
 
     // =============================================================
-    //                      RECEIVE / FALLBACK
+    //                       RECEIVE / FALLBACK
     // =============================================================
 
     /// @notice Rejects ordinary direct native BNB transfers.
     /// @dev
-    /// Valid purchases must call buy() with a package identifier.
-    /// Forced native transfers cannot be universally prevented.
+    /// Purchases must explicitly invoke buy() with a package identifier.
+    /// Forced native BNB transfers cannot be prevented universally.
     receive()
         external
         payable
@@ -1052,10 +1053,10 @@ contract Vending is
         revert DirectBNBTransferNotAllowed();
     }
 
-    /// @notice Rejects unknown calls and unsolicited BNB transfers.
+    /// @notice Rejects unknown calls and unsupported native BNB transfers.
     /// @dev
-    /// Unsupported function selectors cannot initiate purchases.
-    /// Ordinary direct transfers through this entry point revert.
+    /// Unsupported function selectors are not treated as purchases.
+    /// No fallback-based purchasing mechanism is implemented.
     fallback()
         external
         payable
